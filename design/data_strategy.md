@@ -1,51 +1,71 @@
 # Stock Analysis Tool: Data Strategy & Tech Selection
 
-## 1. Free Data Sources for Ingestion
+## TL;DR: The Core Design Decisions
+1.  **Data Sources:** `yfinance` (historical pricing/splits/dividends) and Financial Modeling Prep / Alpha Vantage (fundamental statements).
+2.  **Analytical Storage (The Data):** [DuckDB](https://duckdb.org/) querying local partitioned [Apache Parquet](https://parquet.apache.org/) files. Chosen because financial data is purely columnar time-series (OLAP), making DuckDB infinitely faster than SQLite or Postgres for analysis.
+3.  **State Management (The Metadata):** A local SQLite database (`metadata.db`). Chosen because tracking ingestion status and data versions requires transactional, row-level updates (OLTP) which Parquet cannot do.
+4.  **Versioning Strategy:** **Integer Versioning + Unix Checkpoints**. Because corporate actions (splits) retroactively invalidate decades of historical prices, we cannot blindly append new daily data. Every dataset is stamped with a `data_version` (incremented on full invalidations/re-pulls) and a `checkpoint_id` (incremented on daily appends) to ensure downstream ML models never mix pre/post-split data.
 
-For building a robust local data warehouse of company data, the following free sources are excellent starting points:
+---
 
-1. **Yahoo Finance (`yfinance` Python library)**
-   - **Cost:** Free, no API key required.
-   - **Strengths:** Excellent for historical market pricing, dividends, and stock splits. Also provides basic company profiles and financials (though financials can sometimes be brittle due to website scraping).
-2. **Financial Modeling Prep (FMP)**
-   - **Cost:** Generous free tier (up to 250 API requests per day).
-   - **Strengths:** Extremely high quality fundamental data structure. Parses SEC filings directly into clean tabular data. Highly recommended for income statements, balance sheets, and cash flows.
-3. **Alpha Vantage**
-   - **Cost:** Free tier available (25 API requests per day).
-   - **Strengths:** Great for technical indicators and global market data.
-4. **FRED (Federal Reserve Economic Data)**
-   - **Cost:** Free API key.
-   - **Strengths:** Perfect for macroeconomic data (interest rates, unemployment, inflation) that you might want to overlay with your company analysis.
+## 1. Data Sources for Ingestion
 
-## 2. Data Source Schema & Historical Extensiveness
+-   **Yahoo Finance (`yfinance`)**
+    -   **Cost:** Free, no API key required.
+    -   **Usage:** Daily OHLCV market pricing, dividends, and stock splits. Fully adjusted for historical splits over decades.
+-   **Financial Modeling Prep (FMP)**
+    -   **Cost:** Generous free tier (250 req/day).
+    -   **Usage:** High-quality fundamental data mapped directly from SEC 10-K/10-Q filings (Income Statements, Balance Sheets, Cash Flows).
 
-### Row-wise Richness (Historical Extensiveness)
-- **Pricing:** `yfinance` offers daily, weekly, and monthly pricing spanning as far back as the ticker has existed (e.g., down to the 1920s or 1960s for older indices and companies). It maintains full split and dividend adjustments over decades.
-- **Fundamentals:** FMP and Alpha Vantage generally provide between 5 to 10+ years of historical quarterly and annual financial statements on their free tiers.
-  
-### Column-wise Richness (Schema Design)
-To support a robust analysis engine, your data schema should be highly modular. I recommend standardizing these core tables:
+## 2. Analytical Storage Architecture
 
-1. **`company_metadata`**: `ticker`, `company_name`, `sector`, `industry`, `market_cap`, `exchange`, `cik`.
-2. **`daily_prices`**: `date`, `ticker`, `open`, `high`, `low`, `close`, `adj_close`, `volume`, `dividends_paid`, `stock_splits`.
-3. **`income_statements`**: `date`, `ticker`, `period` (Q1/Q2/Annual), `revenue`, `cost_of_revenue`, `gross_profit`, `operating_expenses`, `net_income`, `eps`.
-4. **`balance_sheets`**: `date`, `ticker`, `period`, `total_assets`, `total_liabilities`, `total_debt`, `total_equity`, `cash_and_equivalents`.
-5. **`cash_flows`**: `date`, `ticker`, `period`, `operating_cash_flow`, `investing_cash_flow`, `financing_cash_flow`, `free_cash_flow`.
-
-## 3. Storage Design
-
-The optimal storage solution must be freemium-based (ideally totally free), reliable, easily parsable for debugging, and natively compatible with the Python data ecosystem.
-
-The winning local combination is **DuckDB + Parquet Files**.
-
-### Why DuckDB over SQLite or PostgreSQL?
-- **Analytical Performance:** Financial data is OLAP (analytical) not OLTP (transactional). You rarely update single rows; instead, you query massive columns of numbers over long date ranges (e.g., "average volume over 5 years"). DuckDB is a columnar database designed specifically for analytics, running orders of magnitude faster than SQLite.
-- **Local & Free:** It runs entirely in-process in Python, requiring zero server configuration. No paid cloud DBs to manage.
-- **Python Synergy:** Native integration with Pandas, Polars, and PyArrow. You can literally write SQL queries that execute directly against a Python DataFrame without copying data in memory.
-- **Debuggability:** DuckDB allows you to query directories of raw [Apache Parquet](https://parquet.apache.org/) files on disk as if they were tables.
+The heavy lifting of the pipeline relies on the **DuckDB + Parquet** combination.
 
 ### High-Level Data Flow
-1. **Ingestion (Python/Requests):** Scripts fetch raw data from `yfinance`/FMP APIs.
-2. **Transformation (Pandas/Polars):** Scripts parse the JSON into DataFrames, clean it, handle missing values, and cast precise datatypes (dates, floats).
-3. **Storage (Disk):** The transformed tables are saved locally as `.parquet` files (e.g., `data/daily_prices/ticker=AAPL/data.parquet`). Parquet retains schema types natively and is highly compressed.
-4. **Consumption (Python + DuckDB):** An internal Python query class accepts arguments or SQL strings, spins up a DuckDB connection, performs lightning-fast reads on the Parquet directory, and returns a rich DataFrame for the end user to analyze.
+1.  **Ingestion:** Python scripts fetch JSON/DataFrames from `yfinance`/FMP APIs.
+2.  **Transformation:** `pandas`/`polars` clean the data and cast strict datatypes (Dates, BIGINTs).
+3.  **Storage:** Saved locally as highly compressed `.parquet` files (e.g., `data/daily_prices/ticker=AAPL/v=3/...`).
+4.  **Consumption:** Python spins up an in-memory `duckdb` connection to run lightning-fast SQL aggregations directly against the Parquet directory, returning DataFrames to the user.
+
+### Analytical Schema Design
+Every row of data written to disk is immutably stamped to guarantee downstream traceability:
+-   `data_version` (BIGINT): The integer version denoting the foundational state.
+-   `checkpoint_id` (BIGINT): The exact UNIX timestamp of ingestion.
+
+**1. `company_metadata` (Dimension Table)**
+-   `ticker` (VARCHAR, Primary Partition Key), `company_name` (VARCHAR), `sector` (VARCHAR), `industry` (VARCHAR), `market_cap` (BIGINT), `exchange` (VARCHAR), `cik` (VARCHAR)
+
+**2. `daily_prices` (Fact Table)**
+-   `date` (DATE, Primary Sort Key), `ticker` (VARCHAR, Primary Partition Key), `open`, `high`, `low`, `close` (DOUBLE), `adj_close` (DOUBLE), `volume` (BIGINT), `dividends_paid` (DOUBLE), `stock_splits` (DOUBLE)
+
+**3. `income_statements` (Fact Table)**
+-   `date` (DATE), `ticker` (VARCHAR), `period` (VARCHAR, e.g., 'Q1'), `revenue`, `cost_of_revenue`, `gross_profit`, `operating_expenses`, `net_income` (BIGINT), `eps` (DOUBLE)
+
+## 3. Metadata & State Management (SQLite)
+
+Because financial data updates across multiple dimensions (daily appends vs. retroactive split invalidations vs. prior-quarter earnings restatements), we must track the ingestion state in a transactional database (`~/.stock_analysis/metadata.db`).
+
+### Versioning Scheme Decision
+We use **Monotonically Increasing Integers (`data_version`) + Unix Timestamps (`checkpoint_timestamp`)**.
+*Why not Semantic Versioning or Timestamps-as-versions?* Integers are the fastest data type for SQL joins. They cleanly separate the concept of a "Fundamental State Change" (integer bump) from a mere "daily update append" (timestamp bump), providing a sane, numeric lock for downstream machine learning models.
+
+### Table 1: `dataset_state` (Current State)
+| ticker | dataset_name      | data_version | checkpoint_timestamp | last_available_record | status  |
+|--------|-------------------|--------------|----------------------|-----------------------|---------|
+| AAPL   | daily_prices      | 2            | 1710531800           | 2026-03-14            | SUCCESS |
+
+#### Ingestion Logic Flow
+1.  **Fetch Delta:** Query SQLite for `AAPL daily_prices`. It sees `last_available_record = 2026-03-14`. Ask `yfinance` for the delta (the last 5 days).
+2.  **Mutation Detection:** Did a stock split occur (`stock_splits > 0`) in those 5 days?
+    -   **Scenario A (Incremental Append):** No splits. Append the 5-day delta to the existing `v=2` Parquet file. Update SQLite: `checkpoint_timestamp = NOW()`, `last_available_record = 2026-03-19`.
+    -   **Scenario B (History Invalidation):** A split *did* occur. The historical `adj_close` prices on disk are wrong. Discard the file. Fetch `period="max"` from `yfinance`. Increment `data_version = 3`, update `checkpoint_timestamp = NOW()`. Save to a *new* partitioned directory: `data/.../v=3/...`.
+
+### Table 2: `dataset_changelog` (Immutable Audit Trail)
+To allow researchers to answer *"Why did my model break on AAPL v3?"*, every run logs an event.
+
+| log_id | ticker | dataset_name | data_version | checkpoint_timestamp | event_type   | reason                                    |
+|--------|--------|--------------|--------------|----------------------|--------------|-------------------------------------------|
+| 2      | AAPL   | daily_prices | 1            | 1600086400           | APPEND       | Daily run                                 |
+| 3      | AAPL   | daily_prices | 2            | 1710531800           | VERSION_BUMP | Stock split detected (ratio 4:1)          |
+
+*(Schema: `log_id` SERIAL PK, `ticker` TEXT, `dataset_name` TEXT, `data_version` INTEGER, `checkpoint_timestamp` INTEGER, `event_type` TEXT, `reason` TEXT)*
